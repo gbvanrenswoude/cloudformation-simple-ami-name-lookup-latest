@@ -1,0 +1,121 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Find an AMI based on name
+
+Resources:
+  LC:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Properties:
+      ImageId: !GetAtt AMI.Id
+      InstanceType: t2.medium
+      BlockDeviceMappings:
+      -
+        DeviceName: /dev/xvda
+        Ebs:
+          VolumeSize: 30
+          
+  AMILookupFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        -
+          PolicyName: Somename
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "ec2:describe*"
+                Resource: "*"
+
+  AMILookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.vendored import requests
+          def lambda_handler(event, context):
+              responseStatus = 'SUCCESS'
+              responseData = {}
+              if event['RequestType'] == 'Delete':
+                  sendResponse(event, context, responseStatus, responseData)
+              else:
+                  try:
+                      val = event['ResourceProperties']['AMIName']
+                      e = boto3.client('ec2')
+                      response = e.describe_images(
+                          Filters=[
+                            {'Name': 'name', 'Values': [val]}
+                          ]
+                      )
+                      print(json.dumps(response))
+                      if response['Images'] == []:
+                          print('No AMIs found for name ' + val)
+                          raise Exception('No AMIs found.')
+                      latest_ami_id = ''
+                      latest_ami_name = ''
+                      latest_ami_creation_date = ''
+                      for ami in response['Images']:
+                          ami_id = ami['ImageId']
+                          ami_name = ami['Name']
+                          ami_creation_date = ami['CreationDate']
+                          if ami_creation_date > latest_ami_creation_date:
+                              latest_ami_creation_date = ami_creation_date
+                              latest_ami_name = ami_name
+                              latest_ami_id = ami_id
+                      print(f'The latest AMI is {latest_ami_id} {latest_ami_name} with creation date {latest_ami_creation_date}')
+                      responseData["Id"] = latest_ami_id
+                      sendResponse(event, context, responseStatus, responseData)
+                  except:
+                      responseStatus = 'FAILED'
+                      responseData = {'Failed': f'AMIs for {val} have not been found in this AWS Account. Make sure you have the AMI available, or permissions to describe images.'}
+                      sendResponse(event, context, responseStatus, responseData)
+          def sendResponse(event, context, responseStatus, responseData):
+              responseBody = {'Status': responseStatus,
+                              'Reason': 'Check details in CW Log Stream: ' + context.log_stream_name,
+                              'PhysicalResourceId': context.log_stream_name,
+                              'StackId': event['StackId'],
+                              'RequestId': event['RequestId'],
+                              'LogicalResourceId': event['LogicalResourceId'],
+                              'Data': responseData}
+              print ('RESPONSE BODY:' + json.dumps(responseBody))
+              try:
+                  req = requests.put(event['ResponseURL'], data=json.dumps(responseBody))
+                  if req.status_code != 200:
+                      print(req.text)
+                      raise Exception('Received non 200 response while sending response to CF Stack.')
+                  return
+              except requests.exceptions.RequestException as e:
+                  print(e)
+                  raise
+
+      Description: Cloudformation Custom Resource for AMI lookups in CloudFormation
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Timeout: 180
+      Runtime: python3.7
+      Role:
+        Fn::GetAtt: AMILookupFunctionRole.Arn
+  AMI:
+    Type: Custom::AMI
+    Properties:
+      ServiceToken: !GetAtt AMILookupFunction.Arn
+      AMIName: 'some-wildcard-ami-name-*'
